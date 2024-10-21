@@ -70,15 +70,19 @@ func (e *Election) Campaign(ctx context.Context, val string) error {
 	s := e.session
 	client := e.session.Client()
 
+	// 生成相同前缀的 Key 进行选主
 	k := fmt.Sprintf("%s%x", e.keyPrefix, s.Lease())
 	txn := client.Txn(ctx).If(v3.Compare(v3.CreateRevision(k), "=", 0))
+	// 将续约跟 session 的 lease 进行绑定, Session 不过期就一直是 master
 	txn = txn.Then(v3.OpPut(k, val, v3.WithLease(s.Lease())))
+	// 如果不是首次创建, 那么获取对应 key 的值用于后续值更新
 	txn = txn.Else(v3.OpGet(k))
 	resp, err := txn.Commit()
 	if err != nil {
 		return err
 	}
 	e.leaderKey, e.leaderRev, e.leaderSession = k, resp.Header.Revision, s
+	// 如果事务提交没有成功则通过, Proclaim 来宣布一个最新的值
 	if !resp.Succeeded {
 		kv := resp.Responses[0].GetResponseRange().Kvs[0]
 		e.leaderRev = kv.CreateRevision
@@ -90,12 +94,13 @@ func (e *Election) Campaign(ctx context.Context, val string) error {
 		}
 	}
 
+	// 如果自己不是主节点则会阻塞, 等待前面的 key 被删除后自己成为主节点
 	_, err = waitDeletes(ctx, client, e.keyPrefix, e.leaderRev-1)
 	if err != nil {
 		// clean up in case of context cancel
 		select {
 		case <-ctx.Done():
-			e.Resign(client.Ctx())
+			e.Resign(client.Ctx()) // context 被取消的发起新一轮选主
 		default:
 			e.leaderSession = nil
 		}
